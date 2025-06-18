@@ -13,7 +13,7 @@ from nes_py.wrappers import JoypadSpace
 from Contra.actions import COMPLEX_MOVEMENT
 
 # Hiperparámetros
-EPISODES = 500
+EPISODES = 10
 GAMMA = 0.99
 LR = 1e-4
 BATCH_SIZE = 32
@@ -127,7 +127,7 @@ def make_env(env_name: str, **kwargs):
     env = FrameSkip(env, skip=4)
     env = WrapFrame(env)
     env = ImageToPyTorch(env)
-    env = BufferWrapper(env, n_steps=4)
+    # env = BufferWrapper(env, n_steps=4)
 
     return env
 
@@ -270,6 +270,12 @@ memory = ExperienceBuffer(MEM_SIZE)
 
 epsilon = EPS_START
 
+best_reward = -float("inf")
+
+reward_list = []
+mean_rewards = []
+SAVE_EVERY = 10
+
 # Entrenamiento principal
 for episode in range(EPISODES):
     state = env.reset()
@@ -298,6 +304,19 @@ for episode in range(EPISODES):
         target_net.load_state_dict(policy_net.state_dict())
 
     print(f"Episode {episode}: Total reward = {total_reward}, Epsilon = {epsilon:.3f}")
+
+    reward_list.append(total_reward)
+
+    if total_reward > best_reward:
+        best_reward = total_reward
+        torch.save(policy_net.state_dict(), "best_dqn_contra.pth")
+        print(f"New best reward: {best_reward:.2f} — model saved.")
+
+    if (episode + 1) % SAVE_EVERY == 0:
+        mean = np.mean(reward_list[-SAVE_EVERY:])
+        mean_rewards.append(mean)
+        np.save("rewards_contra.npy", np.array(mean_rewards))
+
 
 torch.save(policy_net.state_dict(), "dqn_contra.pth")
 env.close()
