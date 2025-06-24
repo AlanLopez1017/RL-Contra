@@ -1,4 +1,3 @@
-
 from collections import deque
 
 import cv2
@@ -8,14 +7,16 @@ import torch
 from gym import spaces
 from nes_py.wrappers import JoypadSpace
 
-from Contra.actions import COMPLEX_MOVEMENT
+from Contra.actions import BASIC_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY, SIMPLE_MOVEMENT
 
 
 # Wrappers (deben coincidir exactamente con los usados en entrenamiento)
 class FrameSkip(gym.Wrapper):
     def __init__(self, env, skip=4):
         super(FrameSkip, self).__init__(env)
-        self._obs_buffer = np.zeros((2, *env.observation_space.shape), dtype=env.observation_space.dtype)
+        self._obs_buffer = np.zeros(
+            (2, *env.observation_space.shape), dtype=env.observation_space.dtype
+        )
         self._skip = skip
 
     def step(self, action):
@@ -36,33 +37,49 @@ class FrameSkip(gym.Wrapper):
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
 
+
 class WrapFrame(gym.ObservationWrapper):
     def __init__(self, env, width=84, height=84):
         super().__init__(env)
         self.width = width
         self.height = height
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.height, self.width, 1), dtype=env.observation_space.dtype)
+        self.observation_space = spaces.Box(
+            low=0,
+            high=255,
+            shape=(self.height, self.width, 1),
+            dtype=env.observation_space.dtype,
+        )
 
     def observation(self, frame):
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        frame = cv2.resize(
+            frame, (self.width, self.height), interpolation=cv2.INTER_AREA
+        )
         return frame[:, :, None]
+
 
 class ImageToPyTorch(gym.ObservationWrapper):
     def __init__(self, env):
         super(ImageToPyTorch, self).__init__(env)
         obs = self.observation_space
         new_shape = (obs.shape[-1], obs.shape[0], obs.shape[1])
-        self.observation_space = spaces.Box(low=obs.low.min(), high=obs.high.max(), shape=new_shape, dtype=obs.dtype)
+        self.observation_space = spaces.Box(
+            low=obs.low.min(), high=obs.high.max(), shape=new_shape, dtype=obs.dtype
+        )
 
     def observation(self, observation):
         return np.moveaxis(observation, 2, 0)
+
 
 class BufferWrapper(gym.ObservationWrapper):
     def __init__(self, env, n_steps):
         super(BufferWrapper, self).__init__(env)
         obs = env.observation_space
-        new_obs = spaces.Box(obs.low.repeat(n_steps, axis=0), obs.high.repeat(n_steps, axis=0), dtype=obs.dtype)
+        new_obs = spaces.Box(
+            obs.low.repeat(n_steps, axis=0),
+            obs.high.repeat(n_steps, axis=0),
+            dtype=obs.dtype,
+        )
         self.observation_space = new_obs
         self.buffer = deque(maxlen=n_steps)
 
@@ -75,6 +92,7 @@ class BufferWrapper(gym.ObservationWrapper):
     def observation(self, observation):
         self.buffer.append(observation)
         return np.concatenate(self.buffer)
+
 
 # Red neuronal (misma arquitectura)
 import torch.nn as nn
@@ -106,15 +124,17 @@ class DQN(nn.Module):
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
+
 # Función para crear entorno
 def make_env(env_name):
     env = gym.make(env_name)
-    env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    env = JoypadSpace(env, RIGHT_ONLY)
     env = FrameSkip(env, skip=4)
     env = WrapFrame(env)
     env = ImageToPyTorch(env)
     env = BufferWrapper(env, n_steps=4)
     return env
+
 
 # Carga del entorno y del modelo
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -125,12 +145,26 @@ input_shape = state.shape
 n_actions = env.action_space.n
 
 model = DQN(input_shape, n_actions).to(device)
-model.load_state_dict(torch.load("dqn_contra.pth", map_location=device))
+model.load_state_dict(torch.load("best_dqn_contra.pth", map_location=device))
 model.eval()
 
 # Reproducción de un episodio
 total_reward = 0
 done = False
+
+
+# Configurar grabación de video
+video_filename = "contra_run.mp4"
+frame_height, frame_width = 240, 256
+fps = 60
+video_writer = cv2.VideoWriter(
+    video_filename,
+    cv2.VideoWriter_fourcc(*"mp4v"),
+    fps,
+    (frame_width, frame_height),
+)
+
+
 while not done:
     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -140,5 +174,11 @@ while not done:
     total_reward += reward
     env.render()  # Quita si no quieres visualizar
 
+    # Grabación del frame
+    frame_rgb = env.render(mode="rgb_array")
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    video_writer.write(frame_bgr)
+
+video_writer.release()
 print(f"Total reward (test run): {total_reward}")
 env.close()
