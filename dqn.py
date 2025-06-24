@@ -1,3 +1,4 @@
+import math
 import random
 from collections import deque
 
@@ -8,20 +9,24 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from gym import spaces
+from gym.wrappers import RecordVideo
 from nes_py.wrappers import JoypadSpace
 
-from Contra.actions import COMPLEX_MOVEMENT
+from Contra.actions import BASIC_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY, SIMPLE_MOVEMENT
 
 # Hiperparámetros
-EPISODES = 10
+EPISODES = 50
 GAMMA = 0.99
 LR = 1e-4
 BATCH_SIZE = 32
-MEM_SIZE = 10000
-EPS_START = 1.0
+MEM_SIZE = 10000  # 10000
+EPS_START = 1
 EPS_END = 0.01
-EPS_DECAY = 0.995
+# EPS_DECAY = 0.995
+EPS_DECAY_EPISODES = int(0.7 * EPISODES)
+EPS_DECAY = (EPS_START - EPS_END) / EPS_DECAY_EPISODES
 TARGET_UPDATE = 10
+MIN_REPLAY_SIZE = 1000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -123,11 +128,11 @@ class BufferWrapper(gym.ObservationWrapper):
 def make_env(env_name: str, **kwargs):
 
     env = gym.make(env_name, **kwargs)
-    env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    env = JoypadSpace(env, RIGHT_ONLY)
     env = FrameSkip(env, skip=4)
     env = WrapFrame(env)
     env = ImageToPyTorch(env)
-    # env = BufferWrapper(env, n_steps=4)
+    env = BufferWrapper(env, n_steps=4)
 
     return env
 
@@ -212,6 +217,51 @@ class ExperienceBuffer:
         return [self.buffer[idx] for idx in indices]
 
 
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.buffer = []
+        self.priorities = []
+        self.alpha = alpha  # control de cuánta prioridad se usa (0 = uniforme, 1 = 100% prioritario)
+        self.position = 0
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def append(self, experience):
+        max_priority = max(self.priorities, default=1.0)
+
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(experience)
+            self.priorities.append(max_priority)
+        else:
+            self.buffer[self.position] = experience
+            self.priorities[self.position] = max_priority
+            self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size, beta=0.4):
+        if len(self.buffer) == 0:
+            return [], []
+
+        priorities = np.array(self.priorities)
+        probs = priorities**self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+
+        # pesos de importancia para corregir sesgo
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()  # normalizar
+
+        return samples, indices, np.array(weights, dtype=np.float32)
+
+    def update_priorities(self, indices, new_priorities):
+        for idx, priority in zip(indices, new_priorities):
+            self.priorities[idx] = priority
+
+
 # Acción con política epsilon-greedy
 def select_action(state, epsilon):
     if random.random() < epsilon:
@@ -223,18 +273,21 @@ def select_action(state, epsilon):
 
 # Entrenamiento
 def train():
-    if len(memory) < BATCH_SIZE:
+    if len(memory) < MIN_REPLAY_SIZE:
         return
 
     # batch = random.sample(memory, BATCH_SIZE)
     batch = memory.sample(BATCH_SIZE)
+    # batch, indices, weights = memory.sample(BATCH_SIZE)
+
     states, actions, rewards, next_states, dones = zip(*batch)
 
-    states = torch.FloatTensor(states).to(device)
+    states = torch.FloatTensor(np.array(states)).to(device)
     actions = torch.LongTensor(actions).unsqueeze(1).to(device)
     rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
-    next_states = torch.FloatTensor(next_states).to(device)
+    next_states = torch.FloatTensor(np.array(next_states)).to(device)
     dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+    # weights = torch.FloatTensor(weights).unsqueeze(1).to(device)  #############
 
     q_values = policy_net(states).gather(1, actions)
     with torch.no_grad():
@@ -243,15 +296,38 @@ def train():
 
     loss = nn.MSELoss()(q_values, target_q)
 
+    """
+    td_errors = (q_values - target_q).squeeze()  # forma [batch] ############
+    losses = td_errors**2  ######
+
+    # 6. Aplicar pesos de importancia y optimizar
+    loss = (losses * weights.squeeze()).mean()  ########
+
+    """
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+
+    # new_priorities = (
+    #    td_errors.abs().detach().cpu().numpy() + 1e-6
+    # )  # evitar prioridad 0 #############
+    # memory.update_priorities(indices, new_priorities)  ################
 
 
 # Inicialización del entorno
 # env = gym.make("Contra-v0")  # usa "rgb_array" si no quieres visualizar
 # env = JoypadSpace(env, COMPLEX_MOVEMENT)
 # env = FrameSkip(env, skip=4)
+
+
+def get_epsilon(episode):
+    if episode < EPS_DECAY_EPISODES:
+        decay = (EPS_START - EPS_END) / EPS_DECAY_EPISODES
+        return max(EPS_END, EPS_START - decay * episode)
+    else:
+        return EPS_END
+
+
 env = make_env("Contra-v0")
 
 action_size = env.action_space.n
@@ -266,7 +342,10 @@ target_net.load_state_dict(policy_net.state_dict())
 
 optimizer = optim.Adam(policy_net.parameters(), lr=LR)
 # memory = deque(maxlen=MEM_SIZE)
+
+
 memory = ExperienceBuffer(MEM_SIZE)
+# memory = PrioritizedReplayBuffer(MEM_SIZE)
 
 epsilon = EPS_START
 
@@ -276,14 +355,33 @@ reward_list = []
 mean_rewards = []
 SAVE_EVERY = 10
 
+
+#######
+# eval_env = make_env('Contra-v0')
+# eval_env = RecordVideo(
+#    eval_env,
+#    video_folder = './videos',
+#    episode_trigger = lambda episode_id: episode_id % 100 == 0
+# )
+
+######
+
 # Entrenamiento principal
 for episode in range(EPISODES):
     state = env.reset()
     # state = preprocess(state)
     total_reward = 0
 
-    for t in range(1000):  # creo que es lo de batch
-        action = select_action(state, epsilon)
+    if episode % 100 == 0 and episode > 0:
+        epsilon_override = 0.5
+        print(f"Exploración forzada")
+    else:
+        epsilon_override = get_epsilon(epsilon)
+
+    done = False
+    steps = 0
+    while not done:  # for t in range(1000):  # Limite de pasos por episodio
+        action = select_action(state, epsilon_override)
         next_state, reward, done, _ = env.step(action)
 
         # next_state = preprocess(next_state)
@@ -293,10 +391,13 @@ for episode in range(EPISODES):
 
         train()
 
-        if done:
-            break
+        #    if done:
+        #        break
+        steps += 1
 
-    epsilon = max(EPS_END, epsilon * EPS_DECAY)
+    print(f"steps: {steps}, episode -> {episode}")
+    # epsilon = max(EPS_END, epsilon * EPS_DECAY)
+    epsilon = max(EPS_END, EPS_START - EPS_DECAY * episode)
 
     # env.render()
 
@@ -311,6 +412,24 @@ for episode in range(EPISODES):
         best_reward = total_reward
         torch.save(policy_net.state_dict(), "best_dqn_contra.pth")
         print(f"New best reward: {best_reward:.2f} — model saved.")
+
+        # try:
+        #    video_env = make_env("Contra-v0")
+        #    video_env = RecordVideo(
+        #        video_env, video_folder="./videos", name_prefix=f"SM-best_ep{episode}"
+        #    )
+        #    state_v = video_env.reset()
+        #    done = False
+    #
+    #           while not done:
+    #              state_tensor = torch.from_numpy(state_v).float().unsqueeze(0).to(device)
+    #             with torch.no_grad():
+    #                action = policy_net(state_tensor).argmax().item()
+    # state_v, _, done, _ = video_env.step(action)
+
+    #      video_env.close()
+    #  except Exception as e:
+    #     print(f"Error al grabar el video del episidio {episode}")
 
     if (episode + 1) % SAVE_EVERY == 0:
         mean = np.mean(reward_list[-SAVE_EVERY:])
