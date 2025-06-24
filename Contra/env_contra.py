@@ -1,7 +1,11 @@
 """An OpenAI Gym interface to the NES game <TODO: Contra>"""
+
+import math
+import time
+
 import numpy as np
 from nes_py import NESEnv
-import time
+
 from Contra.ROMs.decode_target import decode_target
 from Contra.ROMs.rom_path import rom_path
 
@@ -74,7 +78,7 @@ class ContraEnv(NESEnv):
             the integer value of this 10's place representation
 
         """
-        return int(''.join(map(str, self.ram[address:address + length])))
+        return int("".join(map(str, self.ram[address : address + length])))
 
     def _skip_start_screen(self):
         """Press and release start to skip the start screen."""
@@ -150,22 +154,20 @@ class ContraEnv(NESEnv):
     def _x_reward(self):
         """Return the reward based on left right movement between steps."""
         # print("self._x_position", self._x_position)
-        _reward = self._x_position - self._x_position_last
-        # print("_reward ", _reward)
+
+        delta = self._x_position - self._x_position_last
         self._x_position_last = self._x_position
-        # TODO: check whether this is still necessary
-        # resolve an issue where after death the x position resets. The x delta
-        # is typically has at most magnitude of 3, 5 is a safe bound
-        if _reward < -5 or _reward > 5:
+
+        if abs(delta) > 5:
             return 0
 
-        return _reward
+        return math.tanh(delta / 3.0)
 
     @property
     def _death_penalty(self):
         """Return the reward earned by dying."""
         if self._is_dying or self._is_dead:
-            return -25
+            return -1
 
         return 0
 
@@ -179,6 +181,9 @@ class ContraEnv(NESEnv):
         """Handle any RAM hacking after a reset occurs."""
         self._x_position_last = self._x_position
         self._dead_count = 0
+
+        self._last_score = self._score()
+        self._last_enemy_count = self._enemy_count()
 
     # have to recode
     def _did_step(self, done):
@@ -208,9 +213,83 @@ class ContraEnv(NESEnv):
             self._frame_advance(32)
             self._frame_advance(8)
 
+    def _score_reward(self):
+        current_score = self._score()
+        delta = current_score - getattr(self, "_last_score", 0)
+        self._last_score = current_score
+        return delta / 10.0
+
+    def _enemy_count(self):
+        return sum(1 for addr in _ENEMY_TYPE_ADDRESSES if self.ram[addr] != 0)
+
+    def _enemy_kill_reward(self):
+        current_count = self._enemy_count()
+        delta = (
+            getattr(self, "_last_enemy_count", 5) - current_count
+        )  # por si aún no está definido
+        self._last_enemy_count = current_count
+
+        # cada enemigo eliminado da +0.5
+        return max(0, delta) * 0.5
+
     def _get_reward(self):
         """Return the reward after a step occurs."""
-        return self._x_reward + self._death_penalty + self._get_boss_defeated_reward() + self._score()
+        # self._score()
+        """
+        return (
+            self._x_reward
+            + self._death_penalty
+            + self._get_boss_defeated_reward()
+            + self._score_reward()
+            + self._enemy_kill_reward()
+        )
+        """
+
+        """Sistema de recompensas mejorado para Contra"""
+        # 1. Recompensa por progreso (movimiento horizontal)
+        current_x = self._x_position  # Manejar overflow de memoria
+        delta_x = current_x - self._x_position_last
+        self._x_position_last = current_x
+
+        # Filtro para cambios bruscos (reset por muerte o cambio de pantalla)
+        if abs(delta_x) > 5:
+            delta_x = 0
+
+        x_reward = delta_x * 0.1  # +0.1 por pixel avanzado hacia la derecha
+
+        # 2. Recompensa por nuevos máximos (incentiva progreso sostenido)
+        delta_progress = max(0, current_x - getattr(self, "_max_x", 0))
+        self._max_x = max(getattr(self, "_max_x", 0), current_x)
+        progress_reward = delta_progress * 0.05
+
+        # 3. Recompensa por eliminar enemigos
+        current_enemies = sum(
+            1 for addr in _ENEMY_TYPE_ADDRESSES if self.ram[addr] != 0
+        )
+        delta_enemies = getattr(self, "_last_enemy_count", 5) - current_enemies
+        self._last_enemy_count = current_enemies
+        enemy_reward = max(0, delta_enemies) * 1.0  # +1.0 por enemigo
+
+        # 4. Recompensa por derrotar jefes
+        boss_reward = 10.0 if self._get_boss_defeated else 0.0
+
+        # 5. Penalizaciones
+        death_penalty = -15.0 if self._is_dead else 0.0
+        time_penalty = -0.01  # Penalización por tiempo para incentivar velocidad
+        # standstill_penalty = -0.1 if abs(delta_x) == 0 else 0  # Penaliza inactividad
+
+        # Recompensa total compuesta
+        total_reward = (
+            x_reward
+            + enemy_reward
+            + progress_reward
+            + boss_reward
+            + death_penalty
+            + time_penalty
+        )
+
+        # Limitar el rango de la recompensa para estabilidad
+        return max(-15.0, min(15.0, total_reward))
 
     @property
     def _get_boss_defeated(self):
@@ -235,7 +314,7 @@ class ContraEnv(NESEnv):
 
     def _get_boss_defeated_reward(self):
         if self._get_boss_defeated:
-            return 40
+            return 1
         return 0
 
     def _get_done(self):
@@ -246,7 +325,7 @@ class ContraEnv(NESEnv):
 
     def _get_info(self):
         """Return the info after a step occurs"""
-        print("Score", self._score())
+        # print("Score", self._score())
         return dict(
             life=self._life,
             dead=self._is_dead,
@@ -255,7 +334,7 @@ class ContraEnv(NESEnv):
             status=self._player_state,
             x_pos=self._x_position,
             y_pos=self._y_position,
-            defeated=self._get_boss_defeated
+            defeated=self._get_boss_defeated,
         )
 
 
