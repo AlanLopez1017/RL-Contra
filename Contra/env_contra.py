@@ -52,6 +52,8 @@ class ContraEnv(NESEnv):
         self._skip_start_screen()
         # create a backup state to restore from on subsequent calls to reset
         self._backup()
+
+        self._x_total_progress = 0
         print("Make_done")
 
     @property
@@ -247,8 +249,8 @@ class ContraEnv(NESEnv):
 
         """Sistema de recompensas mejorado para Contra"""
         # 1. Recompensa por progreso (movimiento horizontal)
-        current_x = self._x_position  # Manejar overflow de memoria
-        delta_x = current_x - self._x_position_last
+        current_x = int(self._x_position) % 256  # Manejar overflow de memoria
+        delta_x = current_x - int(self._x_position_last)
         self._x_position_last = current_x
 
         # Filtro para cambios bruscos (reset por muerte o cambio de pantalla)
@@ -258,7 +260,7 @@ class ContraEnv(NESEnv):
         x_reward = delta_x * 0.1  # +0.1 por pixel avanzado hacia la derecha
 
         # 2. Recompensa por nuevos máximos (incentiva progreso sostenido)
-        delta_progress = max(0, current_x - getattr(self, "_max_x", 0))
+        delta_progress = max(0, int(current_x) - int(getattr(self, "_max_x", 0)))
         self._max_x = max(getattr(self, "_max_x", 0), current_x)
         progress_reward = delta_progress * 0.05
 
@@ -274,7 +276,23 @@ class ContraEnv(NESEnv):
         boss_reward = 10.0 if self._get_boss_defeated else 0.0
 
         # 5. Penalizaciones
-        death_penalty = -15.0 if self._is_dead else 0.0
+        MAX_DEATH_PENALTY = -30
+        # Detect overflow del NES
+        if delta_x < -128:
+            delta_x += 256
+        elif delta_x > 128:
+            delta_x -= 256
+
+        self._x_total_progress += delta_x
+
+        max_progress_possible = 1500
+        progress_ratio = max(
+            0.0, min(1.0, self._x_total_progress / max_progress_possible)
+        )
+
+        death_penalty = (
+            (1.0 - progress_ratio) * MAX_DEATH_PENALTY if self._is_dead else 0.0
+        )
         time_penalty = -0.01  # Penalización por tiempo para incentivar velocidad
         # standstill_penalty = -0.1 if abs(delta_x) == 0 else 0  # Penaliza inactividad
 
