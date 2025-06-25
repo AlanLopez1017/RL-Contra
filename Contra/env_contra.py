@@ -235,79 +235,52 @@ class ContraEnv(NESEnv):
         return max(0, delta) * 0.5
 
     def _get_reward(self):
-        """Return the reward after a step occurs."""
-        # self._score()
-        """
-        return (
-            self._x_reward
-            + self._death_penalty
-            + self._get_boss_defeated_reward()
-            + self._score_reward()
-            + self._enemy_kill_reward()
-        )
-        """
+        """Recompensa tipo PPO adaptada a tu entorno de Contra."""
 
-        """Sistema de recompensas mejorado para Contra"""
-        # 1. Recompensa por progreso (movimiento horizontal)
-        current_x = int(self._x_position) % 256  # Manejar overflow de memoria
-        delta_x = current_x - int(self._x_position_last)
-        self._x_position_last = current_x
+        reward = 0.0
 
-        # Filtro para cambios bruscos (reset por muerte o cambio de pantalla)
+        # 1. Recompensa por avance horizontal (xscroll)
+        delta_x = self._x_position - self._x_position_last
+        self._x_position_last = self._x_position
+
+        #  Evitar saltos anómalos grandes (overflow o reseteo)
         if abs(delta_x) > 5:
             delta_x = 0
 
-        x_reward = delta_x * 0.1  # +0.1 por pixel avanzado hacia la derecha
+        # Recompensa por avance (clamp entre -3 y 3)
+        x_reward = min(max(delta_x - 0.01, -3), 3)
+        reward += x_reward
 
-        # 2. Recompensa por nuevos máximos (incentiva progreso sostenido)
-        delta_progress = max(0, int(current_x) - int(getattr(self, "_max_x", 0)))
-        self._max_x = max(getattr(self, "_max_x", 0), current_x)
-        progress_reward = delta_progress * 0.05
+        # 2. Recompensa por incremento de Score
+        current_score = self._score()
+        delta_score = current_score - getattr(self, "_last_score", 0)
+        self._last_score = current_score
 
-        # 3. Recompensa por eliminar enemigos
-        current_enemies = sum(
-            1 for addr in _ENEMY_TYPE_ADDRESSES if self.ram[addr] != 0
-        )
-        delta_enemies = getattr(self, "_last_enemy_count", 5) - current_enemies
-        self._last_enemy_count = current_enemies
-        enemy_reward = max(0, delta_enemies) * 1.0  # +1.0 por enemigo
+        # Solo sumamos score positivo (clamp hasta 2)
+        score_reward = min(max(delta_score, 0), 2)
+        reward += score_reward
 
-        # 4. Recompensa por derrotar jefes
-        boss_reward = 10.0 if self._get_boss_defeated else 0.0
+        # 3. Penalización por perder vidas
+        current_lives = self._life
+        if current_lives < getattr(self, "_last_lives", 2):
+            reward -= 15
+        self._last_lives = current_lives
 
-        # 5. Penalizaciones
-        MAX_DEATH_PENALTY = -30
-        # Detect overflow del NES
-        if delta_x < -128:
-            delta_x += 256
-        elif delta_x > 128:
-            delta_x -= 256
+        # 4. Recompensa o penalización al final del episodio
+        done = self._get_done()
+        if done:
+            if current_lives != 0:
+                reward += 50
+            else:
+                reward -= 35
 
-        self._x_total_progress += delta_x
+        # 5. Escalar recompensa (como en el PPO original)
+        reward /= 10.0
 
-        max_progress_possible = 1500
-        progress_ratio = max(
-            0.0, min(1.0, self._x_total_progress / max_progress_possible)
-        )
+        # Limitar el rango final por seguridad
+        reward = max(-15.0, min(15.0, reward))
 
-        death_penalty = (
-            (1.0 - progress_ratio) * MAX_DEATH_PENALTY if self._is_dead else 0.0
-        )
-        time_penalty = -0.01  # Penalización por tiempo para incentivar velocidad
-        # standstill_penalty = -0.1 if abs(delta_x) == 0 else 0  # Penaliza inactividad
-
-        # Recompensa total compuesta
-        total_reward = (
-            x_reward
-            + enemy_reward
-            + progress_reward
-            + boss_reward
-            + death_penalty
-            + time_penalty
-        )
-
-        # Limitar el rango de la recompensa para estabilidad
-        return max(-15.0, min(15.0, total_reward))
+        return reward
 
     @property
     def _get_boss_defeated(self):
